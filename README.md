@@ -1,70 +1,68 @@
 # PuzzleHunter GPU
 
-**PuzzleHunter GPU** — это высокопроизводительный и компактный инструмент для поиска приватных ключей эллиптической кривой **secp256k1** по заданному хэшу `HASH160` (соответствующему сжатым публичным адресам Bitcoin). Поиск выполняется на видеокартах с поддержкой OpenCL (в первую очередь оптимизирован под карты AMD Radeon).
+**PuzzleHunter GPU** is a high-performance, compact OpenCL tool designed to search for compressed secp256k1 private keys by a target `HASH160` (corresponding to compressed Bitcoin public addresses). It is optimized for AMD Radeon GPUs, but other OpenCL-capable devices may work as well.
 
-Программа генерирует приватные ключи внутри заданного диапазона (битность пазла или кастомный диапазон), вычисляет для них сжатую публичную точку, находит её хэш `RIPEMD160(SHA256(compressed_pubkey))` непосредственно на GPU и сопоставляет результат с целевым `HASH160`.
-
----
-
-## ⚡ Ключевые оптимизации и хэшрейт
-
-В ходе последних доработок архитектура математических вычислений на GPU была глубоко оптимизирована, что позволило поднять хэшрейт на видеокарте **AMD Radeon RX 6600 XT** с базовых **~733 Mkeys/s** до **~820 Mkeys/s** (прирост **~12%**):
-
-1. **Быстрое возведение в квадрат (Squaring)**:
-   - Реализован специализированный алгоритм `squareModP256k_internal` в файле [secp256k1.cl](file:///e:/c++/HASH/secp256k1.cl).
-   - За счёт использования математической симметрии перекрестных членов ($a_i \cdot a_j = a_j \cdot a_i$) число 32-битных умножений снижено с **64** до **36** (экономия **43%** на каждой операции возведения в квадрат).
-   - Оптимизация интегрирована во все функции возведения в квадрат, включая модульное обращение (Inversion).
-2. **Аппаратные инструкции видеокарты (Bitselect / Rotate)**:
-   - Ручные побитовые сдвиги и операции выбора в SHA-256 ([sha256.cl](file:///e:/c++/HASH/sha256.cl)) и RIPEMD-160 ([ripemd160.cl](file:///e:/c++/HASH/ripemd160.cl)) заменены на встроенные OpenCL-функции `bitselect` и `rotate`.
-   - Это позволяет компилятору драйвера видеокарты транслировать их напрямую в однотактные аппаратные инструкции GPU (например, `v_bfi_b32` и `v_alignbit_b32` на архитектуре AMD RDNA).
-3. **Оптимальные флаги сборки ядер**:
-   - Для компилятора OpenCL добавлены флаги `-cl-denorms-are-zero`, `-cl-no-signed-zeros` и `-cl-strict-aliasing`, отключающие медленную обработку денормализованных чисел и позволяющие драйверу видеокарты применять агрессивные математические сокращения.
+The program generates candidate private keys inside a selected range (puzzle range or custom range), computes the corresponding compressed public key, performs the `RIPEMD160(SHA256(compressed_pubkey))` hashing directly on the GPU, and compares it with the target `HASH160`.
 
 ---
 
-## 📁 Структура проекта
+## ⚡ Key Optimizations & Performance Achievements
+
+The GPU mathematical pipeline has been heavily optimized, increasing the search hashrate on an **AMD Radeon RX 6600 XT** from the baseline **~733 Mkeys/s** to a peak of **~820 Mkeys/s** (a **~12%** performance improvement):
+
+1. **Custom Fast 256-bit Squaring (Elliptic Curve Arithmetic)**:
+   - Implemented a dedicated `squareModP256k_internal` function in [secp256k1.cl](file:///e:/c++/HASH/secp256k1.cl).
+   - By exploiting the symmetry of the cross-terms ($a_i \cdot a_j = a_j \cdot a_i$), the number of 32-bit multiplications is reduced from **64** to **36** (a **43%** reduction for squaring operations).
+   - This optimization is applied across all modular squaring steps, including modular inversion.
+2. **OpenCL Bitselect and Rotation Intrinsics**:
+   - Replaced manual bitwise operations in SHA-256 ([sha256.cl](file:///e:/c++/HASH/sha256.cl)) and RIPEMD-160 ([ripemd160.cl](file:///e:/c++/HASH/ripemd160.cl)) with OpenCL's built-in `bitselect` and `rotate` functions.
+   - These compile directly to single-cycle GPU hardware instructions (e.g. `v_bfi_b32` and `v_alignbit_b32` on AMD GCN/RDNA architectures).
+3. **Compiler Optimization Flags**:
+   - Added compiler options `-cl-denorms-are-zero`, `-cl-no-signed-zeros`, and `-cl-strict-aliasing` for the OpenCL compiler to enable aggressive driver-level optimization.
+
+---
+
+## 📁 Project Layout
 
 ```text
 .
-|-- main_gpu.cpp              # Хост-код C++ (настройка OpenCL, интерфейс, CPU-валидация)
-|-- puzzle_hunter_kernel.cl   # Главные поисковые ядра OpenCL
-|-- secp256k1.cl              # Арифметика эллиптической кривой secp256k1 на GPU
-|-- sha256.cl                 # Реализация SHA256 на GPU
-|-- ripemd160.cl              # Реализация RIPEMD-160 на GPU
-|-- hash160.cl                # Модуль сравнения HASH160 на GPU
-|-- Int.* / Point.*           # Библиотека длинной арифметики на CPU (для верификации)
-|-- SECP256K1.*               # Управление таблицами генерации и CPU-проверкой
-|-- OpenCL/                   # Заголовочные файлы и линковочная библиотека OpenCL для Windows
-|-- Makefile                  # Скрипт сборки проекта
-`-- hunter.exe                # Готовый исполняемый файл (после компиляции)
+|-- main_gpu.cpp              # Host C++ code (OpenCL setup, CLI, keyboard input, CPU verification)
+|-- puzzle_hunter_kernel.cl   # Main OpenCL search kernels
+|-- secp256k1.cl              # OpenCL secp256k1 math helper functions
+|-- sha256.cl                 # OpenCL SHA-256 implementation
+|-- ripemd160.cl              # OpenCL RIPEMD-160 implementation
+|-- hash160.cl                # HASH160 adapter and comparison helper functions
+|-- Int.* / Point.*           # CPU bigint/point math libraries (for verification)
+|-- SECP256K1.*               # CPU GTable generation and candidate verification
+|-- OpenCL/                   # Minimal OpenCL headers and import library for Windows MinGW
+|-- Makefile                  # Build script
+`-- hunter.exe                # Built executable (after compilation)
 ```
 
 ---
 
-## 🛠 Требования и сборка
+## 🛠 Requirements & Build
 
-Для компиляции требуются компилятор C++ с поддержкой стандарта C++17 и установленные библиотеки OpenCL.
+To compile the project, you need a C++ compiler supporting C++17 and the OpenCL SDK.
 
-### Сборка на Windows (через MSYS2 / MinGW):
-
-1. Установите gcc и make в терминале MSYS2:
+### Build on Windows (via MSYS2 / MinGW-w64):
+1. Install gcc and make in the MSYS2 terminal:
    ```powershell
    pacman -S mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-make
    ```
-2. Убедитесь, что пути к `g++` и `mingw32-make` добавлены в системную переменную `PATH`.
-3. Скомпилируйте проект:
+2. Make sure the paths to `g++` and `mingw32-make` are added to your system `PATH`.
+3. Build the project:
    ```powershell
    mingw32-make clean
    mingw32-make
    ```
 
-### Сборка на Linux (Ubuntu / Debian):
-
-1. Установите необходимые пакеты:
+### Build on Linux (Ubuntu / Debian):
+1. Install the required packages:
    ```bash
    sudo apt install build-essential ocl-icd-opencl-dev
    ```
-2. Скомпилируйте:
+2. Build the project:
    ```bash
    make clean
    make
@@ -72,73 +70,67 @@
 
 ---
 
-## 🚀 Параметры запуска и Usage
+## 🚀 Usage & Parameters
 
 ```powershell
 .\hunter.exe -h <hash160_hex> [-p <puzzle> | -r <startHex:endHex>] [-b <prefix_bytes>] [-G <blocks>] [-t <threads>] [-n <points>] [-w <work_size>]
 ```
 
-### Список параметров:
-
-- `-h <hex>` — Целевой HASH160 (ровно 40 шестнадцатеричных символов).
-- `-p <bits>` — Битность пазла. Диапазон поиска: `[2^(bits-1), 2^bits - 1]`.
-- `-r <start:end>` — Пользовательский диапазон поиска приватного ключа (`startHex:endHex`).
-- `-b <bytes>` — Число проверяемых байт префикса хэша (1..20, по умолчанию 20).
-- `-G <blocks>` — Число блоков OpenCL (default: 64).
-- `-t <threads>` — Число потоков на блок OpenCL (default: 256).
-- `-n <points>` — Точек на поток в одной итерации (BATCH_SIZE) (default: 1024).
-- `-w <size>` — Глобальный рабочий размер OpenCL (ручное переопределение).
-- `--bench <n>` — Запустить быстрый тест производительности на `n` циклов.
-
----
-
-## 💡 Рекомендуемые параметры для RX 6600 XT
-
-Поиск по HASH160 требует значительно больше ресурсов GPU, чем обычный поиск по публичному ключу. Подберите параметры под ваши температурные лимиты (Hotspot):
-
-### 1. Режим сбалансированный (Balanced) 🌿
-
-- **Параметры:** `-G 128 -t 256 -n 1024` или `-G 256 -t 256 -n 1024`
-- **Скорость:** **~600 - 750 Mkeys/s**
-- **Особенности:** Щадящие температуры Hotspot, тихая работа вентиляторов, расход VRAM 1-2 ГБ.
-
-### 2. Режим максимальной эффективности (Max Performance) ⚡ — Рекомендуется
-
-- **Параметры:** `-G 384 -t 256 -n 1024`
-- **Скорость:** **~800 - 820 Mkeys/s**
-- **Особенности:** Оптимальное соотношение пикового хэшрейта и стабильности. Максимально эффективно утилизирует вычислительные блоки RX 6600 XT при умеренном тепловыделении, расход VRAM ~3 ГБ.
-
-### 3. Режим агрессивный (Aggressive / Extreme) 🔥
-
-- **Параметры:** `-G 512 -t 256 -n 1024` или `-G 1024 -t 256 -n 512`
-- **Скорость:** **~800 - 820 Mkeys/s**
-- **Особенности:** Максимальный нагрев и энергопотребление, требует отличного охлаждения видеокарты. Расход VRAM ~4 ГБ.
-
-> **Примечание:** Если программа падает с ошибкой `-61` (Out of memory / resources), уменьшите параметры `-G` (блоки) или `-n` (точки на поток).
+### Command Line Arguments:
+- `-h <hex>`: Target HASH160 (exactly 40 hex characters).
+- `-p <bits>`: Puzzle range bit length. Search space: `[2^(bits-1), 2^bits - 1]`.
+- `-r <start:end>`: Custom search range (`startHex:endHex`).
+- `-b <bytes>`: Number of leading HASH160 bytes to check (1..20, default: 20).
+- `-G <blocks>`: Number of OpenCL blocks (default: 64).
+- `-t <threads>`: Number of threads per block (default: 256).
+- `-n <points>`: Number of points checked per thread per loop iteration (BATCH_SIZE) (default: 1024).
+- `-w <size>`: OpenCL global work size (manual override).
+- `--bench <n>`: Run `n` benchmark loops to test performance.
 
 ---
 
-## 📈 Примеры использования
+## 💡 Recommended Parameters for RX 6600 XT
 
-1. **Запуск бенчмарка для тестирования хэшрейта:**
+Searching by HASH160 is significantly more resource-intensive on the GPU than public key searches. Select a profile based on your cooling and hotspot temperature limits:
 
+### 1. Balanced Profile 🌿
+- **Parameters:** `-G 128 -t 256 -n 1024` or `-G 256 -t 256 -n 1024`
+- **Speed:** **~600 - 750 Mkeys/s**
+- **Pros:** Quiet fans, safe hotspot temperatures, uses 1-2 GB VRAM.
+
+### 2. Max Performance Profile ⚡ (Recommended)
+- **Parameters:** `-G 384 -t 256 -n 1024`
+- **Speed:** **~800 - 820 Mkeys/s**
+- **Pros:** Optimal hashrate-to-temperature balance. Maximizes the usage of AMD Radeon RX 6600 XT compute units with moderate heat output. Uses ~3 GB VRAM.
+
+### 3. Aggressive Profile 🔥
+- **Parameters:** `-G 512 -t 256 -n 1024` or `-G 1024 -t 256 -n 512`
+- **Speed:** **~800 - 820 Mkeys/s**
+- **Pros/Cons:** Maximum heat generation and power consumption. Requires robust cooling. Uses ~4 GB VRAM.
+
+> **Note:** If the program crashes with error `-61` (Out of resources), reduce `-G` (blocks) or `-n` (points per thread).
+
+---
+
+## 📈 Examples
+
+1. **Run a benchmark to test GPU hashrate:**
    ```powershell
    .\hunter.exe -h f6f5431d25bbf7b12e8add9af5e3475c44a0a5b8 -p 71 -G 256 -t 256 -n 1024 --bench 30
    ```
 
-2. **Поиск точного совпадения HASH160 для пазла 66:**
-
+2. **Search for a full HASH160 match inside Puzzle 71:**
    ```powershell
    .\hunter.exe -h f6f5431d25bbf7b12e8add9af5e3475c44a0a5b8 -p 71 -G 256 -t 256 -n 1024
    ```
 
-3. **Быстрый поиск частичного совпадения по префиксу (первые 4 байта):**
+3. **Fast partial search (match first 4 bytes of HASH160):**
    ```powershell
    .\hunter.exe -h f6f5431d25bbf7b12e8add9af5e3475c44a0a5b8 -p 71 -b 4 -G 256 -t 256 -n 1024
    ```
-   _При нахождении частичного совпадения программа выведет его на экран и продолжит поиск. При нахождении полного 20-байтного совпадения работа завершится, а ключ запишется в файл._
+   *Partial matches are displayed on the screen as the search continues. Once a full 20-byte match is found, the search terminates and results are written to a file.*
 
-### Пример вывода реального поиска (пазл 35, частичное и полное совпадение):
+### Example Search Output (Puzzle 35, partial and full match):
 
 ```powershell
 .\hunter.exe -p 35 -h f6d8ce225ffbdecec170f8298c3fc28ae686df25 -G 384 -t 256 -b 4
@@ -178,12 +170,21 @@ Target HASH160: f6d8ce225ffbdecec170f8298c3fc28ae686df25
 
 ---
 
-## 💾 Вывод результатов
+## 💾 Output File
 
-При нахождении полного совпадения программа сохраняет результат в файл `KEYFOUND.txt` в текущей директории. В файл записывается:
+Upon finding a full match, the program saves the results in a file named `KEYFOUND.txt` in the current directory. The file contains:
+- Target and found HASH160 values.
+- Found private key in hex format.
+- Corresponding compressed public key.
+- Total number of checked combinations.
+- Elapsed time and average search speed.
 
-- Целевой и найденный HASH160.
-- Найденный приватный ключ (в hex-формате).
-- Соответствующий сжатый публичный ключ.
-- Общее число проверенных комбинаций.
-- Затраченное время и итоговая средняя скорость поиска.
+---
+
+## Thanks
+
+If this project helped you and you want to say thanks:
+
+```text
+BTC: bc1qa3c5xdc6a3n2l3w0sq3vysustczpmlvhdwr8vc
+```
