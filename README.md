@@ -11,14 +11,17 @@ The program generates candidate private keys inside a selected range (puzzle ran
 The GPU mathematical pipeline has been heavily optimized, increasing the search hashrate on an **AMD Radeon RX 6600 XT** from the baseline **~733 Mkeys/s** to a peak of **~820 Mkeys/s** (a **~12%** performance improvement):
 
 1. **Custom Fast 256-bit Squaring (Elliptic Curve Arithmetic)**:
-   - Implemented a dedicated `squareModP256k_internal` function in [secp256k1.cl](file:///e:/c++/HASH/secp256k1.cl).
+   - Implemented a dedicated `squareModP256k_internal` function in [secp256k1.cl](secp256k1.cl).
    - By exploiting the symmetry of the cross-terms ($a_i \cdot a_j = a_j \cdot a_i$), the number of 32-bit multiplications is reduced from **64** to **36** (a **43%** reduction for squaring operations).
    - This optimization is applied across all modular squaring steps, including modular inversion.
 2. **OpenCL Bitselect and Rotation Intrinsics**:
-   - Replaced manual bitwise operations in SHA-256 ([sha256.cl](file:///e:/c++/HASH/sha256.cl)) and RIPEMD-160 ([ripemd160.cl](file:///e:/c++/HASH/ripemd160.cl)) with OpenCL's built-in `bitselect` and `rotate` functions.
+   - Replaced manual bitwise operations in SHA-256 ([sha256.cl](sha256.cl)) and RIPEMD-160 ([ripemd160.cl](ripemd160.cl)) with OpenCL's built-in `bitselect` and `rotate` functions.
    - These compile directly to single-cycle GPU hardware instructions (e.g. `v_bfi_b32` and `v_alignbit_b32` on AMD GCN/RDNA architectures).
 3. **Compiler Optimization Flags**:
    - Added compiler options `-cl-denorms-are-zero`, `-cl-no-signed-zeros`, and `-cl-strict-aliasing` for the OpenCL compiler to enable aggressive driver-level optimization.
+4. **Optimized GPU Random Number Generator (xoshiro256+)**:
+   - Replaced the more complex `xoshiro256**` with the lightweight `xoshiro256+` algorithm in [puzzle_hunter_kernel.cl](puzzle_hunter_kernel.cl).
+   - This eliminates two heavy 64-bit multiplications and a 64-bit rotation per generated seed on the GPU, streamlining the initialization path for new search batches.
 
 ---
 
