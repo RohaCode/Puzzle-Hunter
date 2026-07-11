@@ -313,6 +313,16 @@ static std::string int128ToString(unsigned __int128 n) {
     return s;
 }
 
+static unsigned __int128 stringToInt128(const std::string& s) {
+    unsigned __int128 val = 0;
+    for (char c : s) {
+        if (c >= '0' && c <= '9') {
+            val = val * 10 + (c - '0');
+        }
+    }
+    return val;
+}
+
 static void printProgressLine(double elapsedSeconds, double speedMkeys, unsigned __int128 totalChecked) {
     std::ostringstream oss;
     oss << "Time          : " << formatElapsed(elapsedSeconds)
@@ -642,7 +652,31 @@ int main(int argc, char* argv[]) {
             return 0;
         }
         unsigned __int128 totalChecked = 0;
+        double totalElapsedSeconds = 0.0;
+        std::string progressFilename = "progress_" + targetHashHex + ".txt";
+
+        if (benchLoops == 0) {
+            std::ifstream pfile(progressFilename);
+            if (pfile) {
+                std::string line;
+                if (std::getline(pfile, line)) {
+                    totalChecked = stringToInt128(line);
+                }
+                if (std::getline(pfile, line)) {
+                    try {
+                        totalElapsedSeconds = std::stod(line);
+                    } catch (...) {
+                        totalElapsedSeconds = 0.0;
+                    }
+                }
+                std::cout << "Loaded previous progress: " << int128ToString(totalChecked) 
+                          << " keys checked, " << formatElapsed(totalElapsedSeconds) << " elapsed.\n";
+            }
+        }
+
         auto start = std::chrono::high_resolution_clock::now();
+        auto lastSaveTime = start;
+
         std::cout << "Target HASH160: " << targetHashHex << "\n";
         std::cout << "Prefix bytes  : " << prefixLen << "\n";
         std::cout << "Mode          : Random GPU\n";
@@ -669,11 +703,27 @@ int main(int argc, char* argv[]) {
         while(true) {
             if (_kbhit()) {
                 int ch = _getch();
-                if (ch == 27) break;
+                if (ch == 27) {
+                    if (benchLoops == 0) {
+                        double finalElapsed = totalElapsedSeconds + std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - start).count();
+                        std::ofstream pfile(progressFilename);
+                        if (pfile) {
+                            pfile << int128ToString(totalChecked) << "\n";
+                            pfile << finalElapsed << "\n";
+                        }
+                        std::cout << "\nProgress saved. Total checked: " << int128ToString(totalChecked) << "\n";
+                    }
+                    break;
+                }
                 if (ch == ' ' || ch == 'p' || ch == 'P') {
                     paused = !paused;
-                    if (paused) std::cout << "\n[PAUSED] Press Space to resume...          " << std::flush;
-                    else { std::cout << "\n[RESUMED]                                 \n" << std::flush; start = std::chrono::high_resolution_clock::now(); totalChecked = 0; }
+                    if (paused) {
+                        const auto now = std::chrono::high_resolution_clock::now();
+                        totalElapsedSeconds += std::chrono::duration<double>(now - start).count();
+                        std::cout << "\r[PAUSED] Press Space to resume..." << std::string(60, ' ') << std::flush;
+                    } else {
+                        start = std::chrono::high_resolution_clock::now();
+                    }
                 }
             }
             if (paused) { std::this_thread::sleep_for(std::chrono::milliseconds(100)); continue; }
@@ -693,9 +743,19 @@ int main(int argc, char* argv[]) {
                     "clEnqueueReadBuffer result");
 
             const auto now = std::chrono::high_resolution_clock::now();
-            const double elapsed = std::chrono::duration<double>(now - start).count();
+            const double elapsed = totalElapsedSeconds + std::chrono::duration<double>(now - start).count();
             const double speedMkeys = (double)totalChecked / elapsed / 1e6;
             printProgressLine(elapsed, speedMkeys, totalChecked);
+
+            // Periodically save progress (every 60 seconds)
+            if (benchLoops == 0 && std::chrono::duration<double>(now - lastSaveTime).count() >= 60.0) {
+                std::ofstream pfile(progressFilename);
+                if (pfile) {
+                    pfile << int128ToString(totalChecked) << "\n";
+                    pfile << elapsed << "\n";
+                }
+                lastSaveTime = now;
+            }
 
             completedLoops++;
             if(benchLoops > 0 && completedLoops >= benchLoops) {
@@ -760,6 +820,13 @@ int main(int argc, char* argv[]) {
                     file << "Total Checked : " << int128ToString(totalChecked) << "\n";
                     file << "Elapsed Time  : " << formatElapsed(elapsed) << "\n";
                     file << "Speed         : " << (double)totalChecked / elapsed / 1e6 << " Mkeys/s\n";
+                }
+                if (benchLoops == 0) {
+                    std::ofstream pfile(progressFilename);
+                    if (pfile) {
+                        pfile << int128ToString(totalChecked) << "\n";
+                        pfile << elapsed << "\n";
+                    }
                 }
                 break;
             }
