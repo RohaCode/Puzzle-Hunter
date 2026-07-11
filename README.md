@@ -173,6 +173,23 @@ Target HASH160: f6d8ce225ffbdecec170f8298c3fc28ae686df25
 
 ---
 
+## 💾 Pause, Resume & Progress Persistence
+
+The program provides robust mechanisms for pausing/resuming search sessions and persisting search progress across runs or unexpected system restarts:
+
+### 1. ⏯️ Pause and Resume (Spacebar)
+- Press **`[SPACE]`** (or `p`/`P`) during search to pause.
+- The terminal display will show `[PAUSED] Press Space to resume...` on the same line.
+- Press **`[SPACE]`** again to resume the search on the same line without cluttering the console.
+- **Accurate Statistics:** The search duration spent on pause is excluded from the speed calculations. Resuming does not reset the total checked keys counter.
+
+### 2. 📝 Automatic Progress Saving & Recovery
+- **Auto-save:** The cumulative number of checked keys and elapsed search time are automatically saved every **60 seconds** to a file named `progress_<target_hash160>.txt` in the program's directory.
+- **Save on Exit (ESC):** Pressing **`[ESC]`** immediately saves the final progress and safely exits.
+- **Crash/Restart Protection:** If the system rebooted or the driver crashed, just start the search with the same target address again. The program will print `Loaded previous progress: ... keys checked, ... elapsed` and resume accumulating statistics exactly where you left off.
+
+---
+
 ## 💾 Output File
 
 Upon finding a full match, the program saves the results in a file named `KEYFOUND.txt` in the current directory. The file contains:
