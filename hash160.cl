@@ -4,6 +4,10 @@
 #include "sha256.cl"
 #include "ripemd160.cl"
 
+#if defined(HASH160_PREFIX_BYTES) && (HASH160_PREFIX_BYTES < 1 || HASH160_PREFIX_BYTES > 20)
+#error HASH160_PREFIX_BYTES must be between 1 and 20
+#endif
+
 static inline unsigned int hash160Endian(unsigned int x)
 {
     return (x << 24) | ((x << 8) & 0x00ff0000) | ((x >> 8) & 0x0000ff00) | (x >> 24);
@@ -49,7 +53,13 @@ static inline bool hash160CompressedMatches(uint256_t x, uint256_t y, __constant
 
 static inline bool hash160PrefixMatches(const uchar hash[20], __constant const uchar* targetHash160, int prefixLen)
 {
+#ifdef HASH160_PREFIX_BYTES
+    // The host includes this value in the OpenCL binary cache key.
+    #pragma unroll
+    for(int i = 0; i < HASH160_PREFIX_BYTES; i++) {
+#else
     for(int i = 0; i < prefixLen; i++) {
+#endif
         if(hash[i] != targetHash160[i]) return false;
     }
 
