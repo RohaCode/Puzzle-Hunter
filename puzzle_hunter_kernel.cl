@@ -41,7 +41,7 @@ static inline ulong rotl64(ulong x, int k)
 
 static inline ulong xoshiro_next(xoshiro_state_t* state)
 {
-    const ulong result = rotl64(state->s1 * 5, 7) * 9; // xoshiro256**
+    const ulong result = state->s0 + state->s3; // xoshiro256+ (optimized for GPU, no 64-bit multiplications)
     const ulong t = state->s1 << 17;
 
     state->s2 ^= state->s0;
@@ -308,7 +308,7 @@ __kernel void puzzle_hunter_search_gpu(
 
 __kernel void puzzle_hunter_check_batch_thread_gpu(
     __global const uint256_t* baseKeys,
-    __global const point_affine_t* batchTable,
+    __constant const point_affine_t* batchTable,
     __constant const uchar* targetHash160,
     const int prefixLen,
     __global const point_affine_t* startPoints,
@@ -372,35 +372,44 @@ __kernel void puzzle_hunter_check_batch_thread_gpu(
             invDenom = inverse;
         }
 
-        uint256_t rise_P = subModP256k(offsetPoint.y, startY);
-        uint256_t slope_P = mulModP256k(rise_P, invDenom);
-        uint256_t slopeSq_P = squareModP256k(slope_P);
-        uint256_t plusX = subModP256k(subModP256k(slopeSq_P, startX), offsetPoint.x);
+        // Both branches subtract the same X sum; normalize it only once.
+        uint256_t xSum = addModP256k(startX, offsetPoint.x);
 
-        uint256_t plusY = addModP256k(negStartY, mulModP256k(slope_P, subModP256k(startX, plusX)));
-        uchar plusHash[20];
-        hash160CompressedBytes(plusX, plusY, plusHash);
-        if(hash160PrefixMatches(plusHash, targetHash160, prefixLen)) {
-            uint256_t finalKey = addSmall256(baseKey, (unsigned int)i);
-            // Only store if within the original range (no overflow)
-            if (isGreaterOrEqual256(finalKey, minKey)) {
-                storeMatchResult(finalKey, plusX, plusY, plusHash, targetHash160, result);
+        // Keep only one point/hash branch live at a time.
+        {
+            uint256_t rise_P = subModP256k(offsetPoint.y, startY);
+            uint256_t slope_P = mulModP256k(rise_P, invDenom);
+            uint256_t slopeSq_P = squareModP256k(slope_P);
+            uint256_t plusX = subModP256k(slopeSq_P, xSum);
+
+            uint256_t plusY = addModP256k(negStartY, mulModP256k(slope_P, subModP256k(startX, plusX)));
+            uchar plusHash[20];
+            hash160CompressedBytes(plusX, plusY, plusHash);
+            if(hash160PrefixMatches(plusHash, targetHash160, prefixLen)) {
+                uint256_t finalKey = addSmall256(baseKey, (unsigned int)i);
+                // Only store if within the original range (no overflow)
+                if (isGreaterOrEqual256(finalKey, minKey)) {
+                    storeMatchResult(finalKey, plusX, plusY, plusHash, targetHash160, result);
+                }
             }
         }
 
-        uint256_t rise_M = negModP256k(addModP256k(offsetPoint.y, startY));
-        uint256_t slope_M = mulModP256k(rise_M, invDenom);
-        uint256_t slopeSq_M = squareModP256k(slope_M);
-        uint256_t minusX = subModP256k(subModP256k(slopeSq_M, startX), offsetPoint.x);
+        {
+            // -(offsetY + startY) == (-startY) - offsetY modulo p.
+            uint256_t rise_M = subModP256k(negStartY, offsetPoint.y);
+            uint256_t slope_M = mulModP256k(rise_M, invDenom);
+            uint256_t slopeSq_M = squareModP256k(slope_M);
+            uint256_t minusX = subModP256k(slopeSq_M, xSum);
 
-        uint256_t minusY = addModP256k(negStartY, mulModP256k(slope_M, subModP256k(startX, minusX)));
-        uchar minusHash[20];
-        hash160CompressedBytes(minusX, minusY, minusHash);
-        if(hash160PrefixMatches(minusHash, targetHash160, prefixLen)) {
-            uint256_t finalKey = subSmall256(baseKey, (unsigned int)i);
-            // Only store if within the original range
-            if (isGreaterOrEqual256(finalKey, minKey)) {
-                storeMatchResult(finalKey, minusX, minusY, minusHash, targetHash160, result);
+            uint256_t minusY = addModP256k(negStartY, mulModP256k(slope_M, subModP256k(startX, minusX)));
+            uchar minusHash[20];
+            hash160CompressedBytes(minusX, minusY, minusHash);
+            if(hash160PrefixMatches(minusHash, targetHash160, prefixLen)) {
+                uint256_t finalKey = subSmall256(baseKey, (unsigned int)i);
+                // Only store if within the original range
+                if (isGreaterOrEqual256(finalKey, minKey)) {
+                    storeMatchResult(finalKey, minusX, minusY, minusHash, targetHash160, result);
+                }
             }
         }
     }
