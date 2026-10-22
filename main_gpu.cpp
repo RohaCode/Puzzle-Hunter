@@ -96,6 +96,48 @@ static void checkCl(cl_int err, const char* what) {
     }
 }
 
+// FNV-1a hash — used to key the OpenCL binary cache by build options
+static uint32_t simpleHash(const std::string& s) {
+    uint32_t h = 2166136261u;
+    for (unsigned char c : s) { h ^= c; h *= 16777619u; }
+    return h;
+}
+
+// Try to load a previously compiled OpenCL binary from disk.
+static bool loadProgramFromCache(cl_context context, cl_device_id device,
+                                  const std::string& cacheFile, cl_program& outProgram) {
+    std::ifstream f(cacheFile, std::ios::binary);
+    if (!f) return false;
+    f.seekg(0, std::ios::end);
+    std::streamsize size = f.tellg();
+    f.seekg(0, std::ios::beg);
+    if (size <= 0) return false;
+    std::vector<unsigned char> binary((size_t)size);
+    if (!f.read(reinterpret_cast<char*>(binary.data()), size)) return false;
+    const unsigned char* ptr = binary.data();
+    size_t bsize = (size_t)size;
+    cl_int binaryStatus = 0, err = 0;
+    cl_program prog = clCreateProgramWithBinary(context, 1, &device, &bsize, &ptr, &binaryStatus, &err);
+    if (err != CL_SUCCESS || binaryStatus != CL_SUCCESS) return false;
+    err = clBuildProgram(prog, 1, &device, "", nullptr, nullptr);
+    if (err != CL_SUCCESS) { clReleaseProgram(prog); return false; }
+    outProgram = prog;
+    return true;
+}
+
+// Save the compiled OpenCL binary to disk for future fast-load.
+static void saveProgramToCache(cl_program program, cl_device_id device, const std::string& cacheFile) {
+    size_t binarySize = 0;
+    if (clGetProgramInfo(program, CL_PROGRAM_BINARY_SIZES, sizeof(size_t), &binarySize, nullptr) != CL_SUCCESS) return;
+    if (binarySize == 0) return;
+    std::vector<unsigned char> binary(binarySize);
+    unsigned char* ptr = binary.data();
+    if (clGetProgramInfo(program, CL_PROGRAM_BINARIES, sizeof(unsigned char*), &ptr, nullptr) != CL_SUCCESS) return;
+    std::ofstream f(cacheFile, std::ios::binary);
+    if (f) f.write(reinterpret_cast<const char*>(binary.data()), (std::streamsize)binarySize);
+    (void)device;
+}
+
 static std::string readKernelSource(const std::string& filename) {
     std::ifstream file(filename);
     if(!file) {
@@ -331,32 +373,6 @@ static void printProgressLine(double elapsedSeconds, double speedMkeys, unsigned
     std::cout << '\r' << oss.str() << std::string(24, ' ') << std::flush;
 }
 
-static int getConsoleCursorY() {
-#ifdef _WIN32
-    CONSOLE_SCREEN_BUFFER_INFO info;
-    if(GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &info)) {
-        return (int)info.dwCursorPosition.Y;
-    }
-#endif
-    return -1;
-}
-
-static void setConsoleCursorY(int y) {
-#ifdef _WIN32
-    if(y >= 0) {
-        HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
-        CONSOLE_SCREEN_BUFFER_INFO info;
-        if(GetConsoleScreenBufferInfo(out, &info)) {
-            COORD pos = info.dwCursorPosition;
-            pos.X = 0;
-            pos.Y = (SHORT)y;
-            SetConsoleCursorPosition(out, pos);
-        }
-    }
-#else
-    (void)y;
-#endif
-}
 
 static void clearConsoleLine() {
     std::cout << '\r' << std::string(120, ' ') << '\r';
@@ -365,11 +381,11 @@ static void clearConsoleLine() {
 static void printPartialBlock(int prefixLen, const std::string& privHex,
                               const std::string& foundHashHex,
                               const std::string& targetHashHex) {
-    std::cout << "================== PARTIAL HASH160 MATCH ===========\n";
-    std::cout << "Prefix bytes  : " << prefixLen << "\n";
-    std::cout << "Private Key   : " << privHex << "\n";
-    std::cout << "Found HASH160 : " << foundHashHex << "\n";
-    std::cout << "Target HASH160: " << targetHashHex << "\n";
+    std::cout << "================== PARTIAL HASH160 MATCH ===========          \n";
+    std::cout << "Prefix bytes  : " << prefixLen << std::string(30, ' ') << "\n";
+    std::cout << "Private Key   : " << privHex << std::string(10, ' ') << "\n";
+    std::cout << "Found HASH160 : " << foundHashHex << std::string(10, ' ') << "\n";
+    std::cout << "Target HASH160: " << targetHashHex << std::string(10, ' ') << "\n";
 }
 
 int main(int argc, char* argv[]) {
@@ -523,28 +539,49 @@ int main(int argc, char* argv[]) {
 
         cl_context context = clCreateContext(nullptr, 1, &device, nullptr, nullptr, &err);
         checkCl(err, "clCreateContext");
-        cl_command_queue queue = clCreateCommandQueue(context, device, 0, &err);
-        checkCl(err, "clCreateCommandQueue");
-
-        std::string source = readKernelSource("puzzle_hunter_kernel.cl");
-        const char* srcPtr = source.c_str();
-        size_t srcLen = source.size();
-        cl_program program = clCreateProgramWithSource(context, 1, &srcPtr, &srcLen, &err);
-        checkCl(err, "clCreateProgramWithSource");
+        // computeQueue: runs kernels | transferQueue: handles async result read-back
+        // Two queues allow GPU compute engine and SDMA engine to work in parallel.
+        cl_command_queue computeQueue = clCreateCommandQueue(context, device, 0, &err);
+        checkCl(err, "clCreateCommandQueue computeQueue");
+        cl_command_queue transferQueue = clCreateCommandQueue(context, device, 0, &err);
+        checkCl(err, "clCreateCommandQueue transferQueue");
 
         std::string buildOpts = "-I . -cl-mad-enable -cl-fast-relaxed-math -cl-denorms-are-zero -cl-no-signed-zeros -cl-strict-aliasing";
         buildOpts += " -D BATCH_SIZE=" + std::to_string(pointsPerThread);
         buildOpts += " -D LOCAL_SIZE=" + std::to_string(threads);
         buildOpts += " -D MAX_BYTE_COUNT=" + std::to_string(maxBytes);
+        buildOpts += " -D HASH160_PREFIX_BYTES=" + std::to_string(prefixLen);
 
-        err = clBuildProgram(program, 1, &device, buildOpts.c_str(), nullptr, nullptr);
-        if(err != CL_SUCCESS) {
-            size_t logSize = 0;
-            clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, 0, nullptr, &logSize);
-            std::vector<char> log(logSize + 1, 0);
-            clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, logSize, log.data(), nullptr);
-            std::cerr << "Build Log:\n" << log.data() << "\n";
-            return 1;
+        // Cache key = FNV-1a hash of build options + all kernel source files
+        std::string allKernelSources = readKernelSource("puzzle_hunter_kernel.cl") +
+                                       readKernelSource("secp256k1.cl") +
+                                       readKernelSource("hash160.cl") +
+                                       readKernelSource("ripemd160.cl") +
+                                       readKernelSource("sha256.cl");
+        std::string cacheFile = "kernel_cache_" + std::to_string(simpleHash(buildOpts + allKernelSources)) + ".bin";
+        cl_program program = nullptr;
+        bool fromCache = loadProgramFromCache(context, device, cacheFile, program);
+        if (fromCache) {
+            std::cout << "Kernel        : loaded from cache (" << cacheFile << ")\n" << std::flush;
+        } else {
+            std::cout << "Kernel        : compiling...\n" << std::flush;
+            std::string source = readKernelSource("puzzle_hunter_kernel.cl");
+            const char* srcPtr = source.c_str();
+            size_t srcLen = source.size();
+            program = clCreateProgramWithSource(context, 1, &srcPtr, &srcLen, &err);
+            checkCl(err, "clCreateProgramWithSource");
+
+            err = clBuildProgram(program, 1, &device, buildOpts.c_str(), nullptr, nullptr);
+            if(err != CL_SUCCESS) {
+                size_t logSize = 0;
+                clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, 0, nullptr, &logSize);
+                std::vector<char> log(logSize + 1, 0);
+                clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, logSize, log.data(), nullptr);
+                std::cerr << "Build Log:\n" << log.data() << "\n";
+                return 1;
+            }
+            saveProgramToCache(program, device, cacheFile);
+            std::cout << "Kernel        : compiled and cached\n" << std::flush;
         }
 
         cl_kernel startKernel = clCreateKernel(program, "puzzle_hunter_search_gpu", &err);
@@ -609,9 +646,15 @@ int main(int argc, char* argv[]) {
         cl_mem bufTargetHash160 = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
                                                  targetHash160.size(), targetHash160.data(), &err);
         checkCl(err, "clCreateBuffer targetHash160");
-        cl_mem bufResult = clCreateBuffer(context, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR,
-                                          sizeof(puzzle_hunter_result_gpu_t), &zeroResult, &err);
-        checkCl(err, "clCreateBuffer result");
+        // Double-buffered result: buf[0] and buf[1] alternate each iteration.
+        // This lets the SDMA engine read buf[cur] while the compute engine works on buf[next].
+        cl_mem bufResult[2];
+        bufResult[0] = clCreateBuffer(context, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR,
+                                      sizeof(puzzle_hunter_result_gpu_t), &zeroResult, &err);
+        checkCl(err, "clCreateBuffer result[0]");
+        bufResult[1] = clCreateBuffer(context, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR,
+                                      sizeof(puzzle_hunter_result_gpu_t), &zeroResult, &err);
+        checkCl(err, "clCreateBuffer result[1]");
 
         cl_mem bufStartPoints = clCreateBuffer(context, CL_MEM_READ_WRITE,
                                                sizeof(point_affine_gpu_t) * groupsPerLaunch, nullptr, &err);
@@ -625,27 +668,34 @@ int main(int argc, char* argv[]) {
         cl_mem bufThreadChain = clCreateBuffer(context, CL_MEM_READ_WRITE, chainBytes, nullptr, &err);
         checkCl(err, "clCreateBuffer threadBatchChain");
 
-        // cyclone_search_gpu
+        // Static kernel args (never change between iterations)
         checkCl(clSetKernelArg(startKernel, 0, sizeof(cl_mem), &bufRngStates), "clSetKernelArg start 0");
-        checkCl(clSetKernelArg(startKernel, 1, sizeof(cl_mem), &bufGTable), "clSetKernelArg start 1");
+        checkCl(clSetKernelArg(startKernel, 1, sizeof(cl_mem), &bufGTable),     "clSetKernelArg start 1");
         checkCl(clSetKernelArg(startKernel, 2, sizeof(cl_mem), &bufTargetHash160), "clSetKernelArg start 2");
-        checkCl(clSetKernelArg(startKernel, 3, sizeof(int), &prefixLen), "clSetKernelArg start 3");
+        checkCl(clSetKernelArg(startKernel, 3, sizeof(int),    &prefixLen),      "clSetKernelArg start 3");
         checkCl(clSetKernelArg(startKernel, 4, sizeof(cl_mem), &bufStartPoints), "clSetKernelArg start 4");
-        checkCl(clSetKernelArg(startKernel, 5, sizeof(cl_mem), &bufResult), "clSetKernelArg start 5");
-        checkCl(clSetKernelArg(startKernel, 6, sizeof(cl_mem), &bufKeys), "clSetKernelArg start 6");
-        checkCl(clSetKernelArg(startKernel, 7, sizeof(uint256_gpu_t), &gpuMinKey), "clSetKernelArg start 7");
+        // arg 5 (bufResult) is set per-iteration via setResultBuf() helper below
+        checkCl(clSetKernelArg(startKernel, 6, sizeof(cl_mem), &bufKeys),        "clSetKernelArg start 6");
+        checkCl(clSetKernelArg(startKernel, 7, sizeof(uint256_gpu_t), &gpuMinKey),    "clSetKernelArg start 7");
         checkCl(clSetKernelArg(startKernel, 8, sizeof(uint256_gpu_t), &gpuRangeMask), "clSetKernelArg start 8");
-        checkCl(clSetKernelArg(startKernel, 9, sizeof(uint256_gpu_t), &gpuRangeLimit), "clSetKernelArg start 9");
+        checkCl(clSetKernelArg(startKernel, 9, sizeof(uint256_gpu_t), &gpuRangeLimit),"clSetKernelArg start 9");
 
-        // cyclone_check_batch_thread_gpu
-        checkCl(clSetKernelArg(threadBatchKernel, 0, sizeof(cl_mem), &bufKeys), "clSetKernelArg batch 0");
-        checkCl(clSetKernelArg(threadBatchKernel, 1, sizeof(cl_mem), &bufBatchTable), "clSetKernelArg batch 1");
-        checkCl(clSetKernelArg(threadBatchKernel, 2, sizeof(cl_mem), &bufTargetHash160), "clSetKernelArg batch 2");
-        checkCl(clSetKernelArg(threadBatchKernel, 3, sizeof(int), &prefixLen), "clSetKernelArg batch 3");
-        checkCl(clSetKernelArg(threadBatchKernel, 4, sizeof(cl_mem), &bufStartPoints), "clSetKernelArg batch 4");
-        checkCl(clSetKernelArg(threadBatchKernel, 5, sizeof(cl_mem), &bufResult), "clSetKernelArg batch 5");
-        checkCl(clSetKernelArg(threadBatchKernel, 6, sizeof(cl_mem), &bufThreadChain), "clSetKernelArg batch 6");
-        checkCl(clSetKernelArg(threadBatchKernel, 7, sizeof(uint256_gpu_t), &gpuMinKey), "clSetKernelArg batch 7");
+        checkCl(clSetKernelArg(threadBatchKernel, 0, sizeof(cl_mem), &bufKeys),        "clSetKernelArg batch 0");
+        checkCl(clSetKernelArg(threadBatchKernel, 1, sizeof(cl_mem), &bufBatchTable),   "clSetKernelArg batch 1");
+        checkCl(clSetKernelArg(threadBatchKernel, 2, sizeof(cl_mem), &bufTargetHash160),"clSetKernelArg batch 2");
+        checkCl(clSetKernelArg(threadBatchKernel, 3, sizeof(int),    &prefixLen),       "clSetKernelArg batch 3");
+        checkCl(clSetKernelArg(threadBatchKernel, 4, sizeof(cl_mem), &bufStartPoints),  "clSetKernelArg batch 4");
+        // arg 5 (bufResult) is set per-iteration
+        checkCl(clSetKernelArg(threadBatchKernel, 6, sizeof(cl_mem), &bufThreadChain),  "clSetKernelArg batch 6");
+        checkCl(clSetKernelArg(threadBatchKernel, 7, sizeof(uint256_gpu_t), &gpuMinKey),"clSetKernelArg batch 7");
+
+        // Helper: switch both kernels' result buffer arg to the given slot (0 or 1).
+        // Per OpenCL spec, kernel args are captured at clEnqueueNDRangeKernel time,
+        // so changing the arg after enqueue does NOT affect already-queued commands.
+        auto setResultBuf = [&](int slot) {
+            checkCl(clSetKernelArg(startKernel,       5, sizeof(cl_mem), &bufResult[slot]), "setResultBuf start");
+            checkCl(clSetKernelArg(threadBatchKernel, 5, sizeof(cl_mem), &bufResult[slot]), "setResultBuf batch");
+        };
 
         if(selfTest || profileLoops > 0) {
             std::cout << "Note: Selftest and Profile modes are currently disabled in the merged LDS version.\n";
@@ -698,13 +748,63 @@ int main(int argc, char* argv[]) {
         std::cout << "Search started. Press [SPACE] to pause, [ESC] to exit.\n";
 
         int completedLoops = 0;
-        int partialBlockY = -1;
+        bool hasPartialBlock = false;
         bool paused = false;
+
+        // ── Double-buffer pipeline state ─────────────────────────────────────────
+        // computeDone[i]: signalled when batchKernel on buf[i] finishes (on computeQueue)
+        // readDone[i]:    signalled when the result read-back of buf[i] finishes (on transferQueue)
+        // hostResult[i]:  host-side copy of the GPU result for buf[i]
+        // These are kept alive across iterations as cross-queue event dependencies.
+        cl_event computeDone[2] = {nullptr, nullptr};
+        cl_event readDone[2]    = {nullptr, nullptr};
+        puzzle_hunter_result_gpu_t hostResult[2] = {};
+
+        // ── Helper: enqueue one full compute iteration on computeQueue ────────────
+        // slot        = which bufResult to target (0 or 1)
+        // waitForRead = optional readDone event to wait on before resetting the buffer
+        //               (prevents resetting buf[slot] while a previous read is still in flight)
+        auto enqueueComputeIteration = [&](int slot, cl_event waitForRead) {
+            cl_uint     nWaits  = (waitForRead != nullptr) ? 1u : 0u;
+            cl_event*   waitPtr = (waitForRead != nullptr) ? &waitForRead : nullptr;
+            // Reset result buffer (waits for the preceding read to finish if needed)
+            checkCl(clEnqueueWriteBuffer(computeQueue, bufResult[slot], CL_FALSE,
+                                         0, sizeof(zeroResult), &zeroResult,
+                                         nWaits, waitPtr, nullptr),
+                    "clEnqueueWriteBuffer reset (double)");
+            // Switch kernel args to this slot – safe per OpenCL spec (captured at Enqueue time)
+            setResultBuf(slot);
+            checkCl(clEnqueueNDRangeKernel(computeQueue, startKernel, 1, nullptr,
+                                            &groupsPerLaunch, nullptr, 0, nullptr, nullptr),
+                    "clEnqueueNDRangeKernel startKernel (double)");
+            checkCl(clEnqueueNDRangeKernel(computeQueue, threadBatchKernel, 1, nullptr,
+                                            &groupsPerLaunch, &localWorkSize,
+                                            0, nullptr, &computeDone[slot]),
+                    "clEnqueueNDRangeKernel batchKernel (double)");
+        };
+
+        // ── Helper: enqueue async result read-back on transferQueue ───────────────
+        // Waits for computeDone[slot] before reading, so we never read partial data.
+        auto enqueueResultRead = [&](int slot) {
+            checkCl(clEnqueueReadBuffer(transferQueue, bufResult[slot], CL_FALSE,
+                                        0, sizeof(hostResult[slot]), &hostResult[slot],
+                                        1, &computeDone[slot], &readDone[slot]),
+                    "clEnqueueReadBuffer (double)");
+        };
+
+        // ── PRIME: kick off iteration 0 on buf[0] (no prior dependencies) ────────
+        enqueueComputeIteration(0, nullptr);
+        int cur = 0;   // buffer slot whose compute just finished / is in-flight
+
         while(true) {
+            // ── Keyboard input ───────────────────────────────────────────────────
             if (_kbhit()) {
                 int ch = _getch();
                 if (ch == 27) {
                     if (benchLoops == 0) {
+                        // Drain the pending GPU work before saving progress
+                        clFinish(computeQueue);
+                        clFinish(transferQueue);
                         double finalElapsed = totalElapsedSeconds + std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - start).count();
                         std::ofstream pfile(progressFilename);
                         if (pfile) {
@@ -718,36 +818,57 @@ int main(int argc, char* argv[]) {
                 if (ch == ' ' || ch == 'p' || ch == 'P') {
                     paused = !paused;
                     if (paused) {
+                        // Drain GPU so timing is accurate
+                        clFinish(computeQueue);
+                        clFinish(transferQueue);
                         const auto now = std::chrono::high_resolution_clock::now();
                         totalElapsedSeconds += std::chrono::duration<double>(now - start).count();
                         std::cout << "\r[PAUSED] Press Space to resume..." << std::string(60, ' ') << std::flush;
                     } else {
                         start = std::chrono::high_resolution_clock::now();
+                        // Re-prime the pipeline after resume
+                        enqueueComputeIteration(0, nullptr);
+                        cur = 0;
                     }
                 }
             }
             if (paused) { std::this_thread::sleep_for(std::chrono::milliseconds(100)); continue; }
 
-            checkCl(clEnqueueWriteBuffer(queue, bufResult, CL_FALSE, 0, sizeof(zeroResult), &zeroResult, 0, nullptr, nullptr),
-                    "clEnqueueWriteBuffer reset result");
+            // ── Pipeline step ────────────────────────────────────────────────────
+            int next = 1 - cur;
 
-            checkCl(clEnqueueNDRangeKernel(queue, startKernel, 1, nullptr, &groupsPerLaunch, nullptr, 0, nullptr, nullptr),
-                    "clEnqueueNDRangeKernel start points");
+            // 1. Enqueue read-back of cur on the transfer queue.
+            //    It will wait for computeDone[cur] internally before starting.
+            enqueueResultRead(cur);
 
-            checkCl(clEnqueueNDRangeKernel(queue, threadBatchKernel, 1, nullptr, &groupsPerLaunch, &localWorkSize, 0, nullptr, nullptr),
-                    "clEnqueueNDRangeKernel batch search");
+            // 2. Enqueue the NEXT compute iteration on the compute queue.
+            //    It must wait for readDone[next] (if set) before resetting buf[next],
+            //    ensuring we don't overwrite a result that hasn't been read yet.
+            enqueueComputeIteration(next, readDone[next]);
+            // readDone[next] is now captured as a dependency by the write command;
+            // release our handle so we don't double-release later.
+            if (readDone[next] != nullptr) {
+                clReleaseEvent(readDone[next]);
+                readDone[next] = nullptr;
+            }
 
             totalChecked += (unsigned __int128)groupsPerLaunch * checkedPerGroup;
-            puzzle_hunter_result_gpu_t result = {};
-            checkCl(clEnqueueReadBuffer(queue, bufResult, CL_TRUE, 0, sizeof(result), &result, 0, nullptr, nullptr),
-                    "clEnqueueReadBuffer result");
 
+            // 3. Wait for the read-back of cur to land on the host.
+            //    While we wait, the GPU is running the next compute iteration in parallel.
+            checkCl(clWaitForEvents(1, &readDone[cur]), "clWaitForEvents readDone");
+
+            // 4. Release the compute event for cur (read is done, no more dependents needed).
+            clReleaseEvent(computeDone[cur]);
+            computeDone[cur] = nullptr;
+
+            // 5. Update progress display
             const auto now = std::chrono::high_resolution_clock::now();
             const double elapsed = totalElapsedSeconds + std::chrono::duration<double>(now - start).count();
             const double speedMkeys = (double)totalChecked / elapsed / 1e6;
             printProgressLine(elapsed, speedMkeys, totalChecked);
 
-            // Periodically save progress (every 60 seconds)
+            // 6. Periodically save progress (every 60 seconds)
             if (benchLoops == 0 && std::chrono::duration<double>(now - lastSaveTime).count() >= 60.0) {
                 std::ofstream pfile(progressFilename);
                 if (pfile) {
@@ -763,6 +884,8 @@ int main(int argc, char* argv[]) {
                 break;
             }
 
+            // 7. Inspect the result from cur (flag set if a match was found)
+            puzzle_hunter_result_gpu_t& result = hostResult[cur];
             if(benchLoops == 0 && result.flag != 0) {
                 const std::string privHex = gpuToHex(result.privKey);
                 const std::string pubHex = pointToCompressedHex(result.x, result.y);
@@ -773,32 +896,46 @@ int main(int argc, char* argv[]) {
 
                 if(cpuPubHex != pubHex) {
                     std::cout << "\nWarning       : GPU candidate failed CPU verification, continuing search.\n";
-                    checkCl(clEnqueueWriteBuffer(queue, bufResult, CL_TRUE, 0, sizeof(zeroResult), &zeroResult, 0, nullptr, nullptr),
-                            "clEnqueueWriteBuffer reset invalid result");
+                    // Flush both queues and clear the stale result so the pipeline restarts clean
+                    clFinish(computeQueue);
+                    clFinish(transferQueue);
+                    if (computeDone[next]) { clReleaseEvent(computeDone[next]); computeDone[next] = nullptr; }
+                    if (readDone[cur])     { clReleaseEvent(readDone[cur]);     readDone[cur]     = nullptr; }
+                    if (readDone[next])    { clReleaseEvent(readDone[next]);    readDone[next]    = nullptr; }
+                    // Re-prime cleanly
+                    enqueueComputeIteration(0, nullptr);
+                    cur = 0;
                     continue;
                 }
 
                 if(result.flag == 1) {
                     clearConsoleLine();
-                    if(partialBlockY < 0) {
-                        partialBlockY = getConsoleCursorY();
-                        printPartialBlock(prefixLen, privHex, foundHashHex, targetHashHex);
-                    } else {
-                        const int progressY = getConsoleCursorY();
-                        setConsoleCursorY(partialBlockY);
-                        for(int i = 0; i < 5; i++) {
-                            clearConsoleLine();
-                            if(i < 4) {
-                                std::cout << "\n";
-                            }
-                        }
-                        setConsoleCursorY(partialBlockY);
-                        printPartialBlock(prefixLen, privHex, foundHashHex, targetHashHex);
-                        setConsoleCursorY(progressY);
+#ifdef _WIN32
+                    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+                    CONSOLE_SCREEN_BUFFER_INFO csbi;
+                    if (hasPartialBlock && GetConsoleScreenBufferInfo(hOut, &csbi)) {
+                        int currentY = csbi.dwCursorPosition.Y;
+                        COORD pos;
+                        pos.X = 0;
+                        pos.Y = (SHORT)(currentY >= 5 ? currentY - 5 : 0);
+                        SetConsoleCursorPosition(hOut, pos);
                     }
+#else
+                    if (hasPartialBlock) {
+                        std::cout << "\033[5A\r";
+                    }
+#endif
+                    printPartialBlock(prefixLen, privHex, foundHashHex, targetHashHex);
+                    hasPartialBlock = true;
                     printProgressLine(elapsed, speedMkeys, totalChecked);
-                    checkCl(clEnqueueWriteBuffer(queue, bufResult, CL_TRUE, 0, sizeof(zeroResult), &zeroResult, 0, nullptr, nullptr),
-                            "clEnqueueWriteBuffer reset partial result");
+                    // Partial match: don't break, keep searching. Re-prime the pipeline.
+                    clFinish(computeQueue);
+                    clFinish(transferQueue);
+                    if (computeDone[next]) { clReleaseEvent(computeDone[next]); computeDone[next] = nullptr; }
+                    if (readDone[cur])     { clReleaseEvent(readDone[cur]);     readDone[cur]     = nullptr; }
+                    if (readDone[next])    { clReleaseEvent(readDone[next]);    readDone[next]    = nullptr; }
+                    enqueueComputeIteration(0, nullptr);
+                    cur = 0;
                     continue;
                 }
 
@@ -830,9 +967,22 @@ int main(int argc, char* argv[]) {
                 }
                 break;
             }
+
+            // 8. Advance to the next slot
+            cur = next;
         }
 
-        clReleaseMemObject(bufResult);
+        // ── Drain: flush any still-pending GPU work ───────────────────────────────
+        clFinish(computeQueue);
+        clFinish(transferQueue);
+        // Release any leftover events
+        for (int i = 0; i < 2; i++) {
+            if (computeDone[i]) { clReleaseEvent(computeDone[i]); computeDone[i] = nullptr; }
+            if (readDone[i])    { clReleaseEvent(readDone[i]);    readDone[i]    = nullptr; }
+        }
+
+        clReleaseMemObject(bufResult[0]);
+        clReleaseMemObject(bufResult[1]);
         clReleaseMemObject(bufStartPoints);
         clReleaseMemObject(bufKeys);
         clReleaseMemObject(bufThreadChain);
@@ -843,7 +993,8 @@ int main(int argc, char* argv[]) {
         clReleaseKernel(startKernel);
         clReleaseKernel(threadBatchKernel);
         clReleaseProgram(program);
-        clReleaseCommandQueue(queue);
+        clReleaseCommandQueue(computeQueue);
+        clReleaseCommandQueue(transferQueue);
         clReleaseContext(context);
         return 0;
     } catch(const std::exception& ex) {
